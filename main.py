@@ -4,21 +4,22 @@ import torch.nn.functional as F
 import pandas as pd
 from data_cleaning.data import RallyDataset
 
+rally_size = 70
+device = 'cuda' if torch.cuda.is_available() else 'mps'
 
 # ***** PARAMETERS ******
 # how many rallies to compute in parallel.
-batch_size = 16
-rally_size = 70
-max_iters = 2000
-eval_interval = 500
-learning_rate = 1e-4
-device = 'cuda' if torch.cuda.is_available() else 'mps'
-eval_iters = 200
+batch_size = 32
 n_embd = 64
-n_head = 2
+n_head = 4
 n_layer = 1
-dropout = 0.2
+dropout = 0.4
+weight_decay = 0.1
+learning_rate = 3e-4
+max_iters = 5000
 
+eval_interval = 500
+eval_iters = 200
 
 torch.manual_seed(1330)
 
@@ -68,14 +69,18 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        shot_losses = torch.zeros(eval_iters)
+        area_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player, n = get_batch(split)
+            shot_logits, area_out, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
             
-            # evaluate the loss
-            logits, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            pad_mask = (inp_shot != 0)
+            pad_mask[:, :3] = False
+            shot_losses[k] = F.cross_entropy(shot_logits[pad_mask], tgt_shot[pad_mask]).item()
+            gold_xy = torch.stack([tgt_x[pad_mask], tgt_y[pad_mask]], dim=-1)
+            area_losses[k] = Gaussian2D_loss(area_out[pad_mask], gold_xy).item()
+        out[split] = {'shot': shot_losses.mean(), 'area': area_losses.mean(), 'total': (shot_losses + area_losses).mean()}
     model.train()
     return out
 
@@ -161,51 +166,73 @@ class ShotPredictionModel(nn.Module):
         # self.area_linear     = nn.Linear(2, n_embd)          # continuous (x,y) — not an embedding
         self.position_embedding_table = nn.Embedding(rally_size, n_embd)
         self.player_embedding = nn.Embedding(36, n_embd)     # 35 players + pad
+        self.area_linear = nn.Linear(2, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, 11)
+        self.area_head = nn.Linear(n_embd, 5)
 
 
     def forward(self, inp_shot, inp_x, inp_y, inp_player, tgt_shot=None, tgt_x=None, tgt_y=None, tgt_player=None):
         B, T = inp_shot.shape
         shot_emb = self.shot_embedding(inp_shot)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        # area_linear = self.area_linear((inp_x, inp_y))
+        area_emb = F.relu(self.area_linear(torch.stack([inp_x, inp_y], dim=-1)))  # (B,T,2) → (B,T,C)
         player_emb = self.player_embedding(inp_player)
 
-        x = shot_emb + pos_emb + player_emb 
+        x = shot_emb + area_emb + pos_emb + player_emb 
         for block in self.blocks:
             x = block(x, inp_shot) # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+
+        shot_logits = self.lm_head(x) # (B,T,vocab_size)
+        area_out = self.area_head(x)
 
         if tgt_shot is None:
             loss = None
         else:
             pad_mask = (inp_shot != 0)
             pad_mask[:, :3] = False
-            loss = F.cross_entropy(logits[pad_mask], tgt_shot[pad_mask])
+            loss_shot = F.cross_entropy(shot_logits[pad_mask], tgt_shot[pad_mask])
+            gold_xy = torch.stack([tgt_x[pad_mask], tgt_y[pad_mask]], dim=-1)
+            loss_area = Gaussian2D_loss(area_out[pad_mask], gold_xy)
+            loss = loss_shot + loss_area
 
-        return logits, loss
+        return shot_logits, area_out, loss
     
+def Gaussian2D_loss(V_pred, V_trgt):
+    normx = V_trgt[:, 0] - V_pred[:, 0]
+    normy = V_trgt[:, 1] - V_pred[:, 1]
+    sx = torch.exp(V_pred[:, 2])
+    sy = torch.exp(V_pred[:, 3])
+    corr = torch.tanh(V_pred[:, 4])
+
+    sxsy = sx * sy
+    z = (normx / sx) ** 2 + (normy / sy) ** 2 - 2 * corr * normx * normy / sxsy
+    neg_rho = 1 - corr ** 2
+
+    result = torch.exp(-z / (2 * neg_rho))
+    denom = 2 * 3.14159265 * sxsy * torch.sqrt(neg_rho)
+    result = -torch.log(torch.clamp(result / denom, min=1e-20))
+    return result.mean()
     
 model = ShotPredictionModel()
 model.to(device)
 
 # create a PyTorch optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 for iter in range(max_iters):
 
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
+        t, v = losses['train'], losses['val']
+        print(f"step {iter}: train {t['shot']:.4f}(shot type)+{t['area']:.4f}(landing area)={t['total']:.4f} | val {v['shot']:.4f}+{v['area']:.4f}={v['total']:.4f}")
     # sample a batch of data
     inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player, n = get_batch('train')
     # evaluate the loss
-    logits, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
+    shot_logits, area_out, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -213,18 +240,33 @@ for iter in range(max_iters):
 
 # grab one batch from val
 inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player, n = get_batch('val')
-logits, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot)
+shot_logits, area_out, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
 
 # for the first rally in the batch
 rally_len = n[0].item()
-preds = logits[0].argmax(dim=-1)  # predicted shot type at each position
+preds = shot_logits[0].argmax(dim=-1)
+area = area_out[0]  # (T, 5)
 
 type_names = ['PAD'] + list(uniques)
 
-print("pos | predicted        | actual           | correct?")
-print("----|------------------|------------------|--------")
+print("pos | predicted        | actual           | ✓? | pred (x, y)     | actual (x, y)")
+print("----|------------------|------------------|----|-----------------|----------------")
 for t in range(rally_len):
     pred_name = type_names[preds[t].item()]
     true_name = type_names[tgt_shot[0][t].item()]
     match = "✓" if preds[t].item() == tgt_shot[0][t].item() else "✗"
-    print(f"  {t} | {pred_name:16s} | {true_name:16s} | {match}")
+    px, py = area[t][0].item(), area[t][1].item()  # mux, muy from Gaussian
+    tx, ty = tgt_x[0][t].item(), tgt_y[0][t].item()
+    print(f"  {t} | {pred_name:16s} | {true_name:16s} | {match}  | ({px:+.2f}, {py:+.2f})  | ({tx:+.2f}, {ty:+.2f})")
+
+    correct, total = 0, 0
+    
+for _ in range(100):
+    inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player, n = get_batch('val')
+    shot_logits, area_out, loss = model(inp_shot, inp_x, inp_y, inp_player, tgt_shot, tgt_x, tgt_y, tgt_player)
+    pad_mask = (inp_shot != 0)
+    pad_mask[:, :3] = False
+    preds = shot_logits[pad_mask].argmax(dim=-1)
+    correct += (preds == tgt_shot[pad_mask]).sum().item()
+    total += pad_mask.sum().item()
+print(f"accuracy: {correct/total:.4f}")
